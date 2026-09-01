@@ -16,18 +16,7 @@ Webchat 是一個即時公開聊天室範例專案，包含靜態前端、REST A
 
 ## 架構概覽
 
-```mermaid
-flowchart LR
-	Client[webchatclient] -->|REST login/register/query/send| API[webchatapi :9091]
-	Client -->|WebSocket STOMP| Socket[webchatsocket :9092]
-	API --> MySQL[(MySQL)]
-	API --> Redis[(Redis)]
-	API -->|publish server-push event| RabbitMQ[(RabbitMQ topic exchange)]
-	Socket --> Redis
-	Socket --> MySQL
-	Socket -->|consume server-push event| RabbitMQ
-	Socket -->|/topic/chat.public<br/>/user/queue/server-push| Client
-```
+![Webchat 架構概覽](./assets/webchat-architecture.jpg)
 
 主要資料流：
 
