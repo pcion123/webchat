@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+        PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.springtest.webchatapi.repository.AccountMapper">
+
+    <resultMap id="AccountMap" type="Account">
+        <id property="accountId" column="account_id" />
+        <result property="userId" column="user_id" />
+        <result property="username" column="username" />
+        <result property="passwordHash" column="password_hash" />
+        <result property="status" column="status" />
+        <result property="lastLoginTime" column="last_login_time" />
+        <result property="createTime" column="create_time" />
+        <result property="updateTime" column="update_time" />
+    </resultMap>
+
+    <sql id="BaseColumns">
+        account_id, user_id, username, password_hash, status, last_login_time, create_time,
+        update_time
+    </sql>
+
+    <insert id="insert" parameterType="Account">
+        INSERT INTO account (account_id, user_id, username, password_hash, status,
+            last_login_time, create_time, update_time)
+        VALUES (#{accountId}, #{userId}, #{username}, #{passwordHash}, #{status},
+            #{lastLoginTime}, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+    </insert>
+
+    <select id="findByUsername" resultMap="AccountMap">
+        SELECT <include refid="BaseColumns" />
+        FROM account
+        WHERE username = #{username}
+    </select>
+
+    <select id="findByUserId" resultMap="AccountMap">
+        SELECT <include refid="BaseColumns" />
+        FROM account
+        WHERE user_id = #{userId}
+    </select>
+
+    <select id="countByUsername" resultType="long">
+        SELECT COUNT(*)
+        FROM account
+        WHERE username = #{username}
+    </select>
+
+    <update id="updateLastLoginTime">
+        UPDATE account
+        SET last_login_time = CURRENT_TIMESTAMP,
+            update_time = CURRENT_TIMESTAMP
+        WHERE account_id = #{accountId}
+    </update>
+</mapper>

@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Webchat Online Room</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="styles.css">
+</head>
+
+<body>
+    <main class="shell">
+        <header class="topbar">
+            <div class="title-block">
+                <p class="eyebrow">webchat online room</p>
+                <h1>Public Chat</h1>
+                <p class="summary">Sign in through webchatapi, connect to webchatsocket with your access token, and
+                    join the live public room.</p>
+            </div>
+
+            <div class="topbar-status">
+                <button id="themeToggleButton" class="ghost theme-toggle" type="button"
+                    aria-label="Switch color theme">Dark</button>
+
+                <section class="room-status-card" aria-label="Room status">
+                    <div class="room-status-metric">
+                        <p class="metric-label">Online</p>
+                        <p class="metric-value" id="onlineCount">-</p>
+                    </div>
+                    <div class="room-status-metric">
+                        <p class="metric-label">Health</p>
+                        <p class="metric-value" id="lastHealth">-</p>
+                    </div>
+                    <div class="room-status-metric connection-metric">
+                        <p class="metric-label">Node</p>
+                        <p class="metric-value" id="socketNodeId" title="-">-</p>
+                    </div>
+                    <div class="room-status-metric connection-metric">
+                        <p class="metric-label">Session</p>
+                        <p class="metric-value" id="socketSessionId" title="-">-</p>
+                    </div>
+                </section>
+
+                <section class="status-card" id="statusCard" aria-live="polite">
+                    <p class="status-label">Socket</p>
+                    <div class="status-value">
+                        <span class="status-dot" aria-hidden="true"></span>
+                        <span id="statusText">Idle</span>
+                    </div>
+                </section>
+            </div>
+        </header>
+
+        <section class="workspace">
+            <aside class="sidebar" aria-label="Session controls">
+                <section class="panel" id="authPanel">
+                    <div class="panel-header compact-header">
+                        <div>
+                            <h2 class="panel-title">Account</h2>
+                            <p class="panel-note">Token is kept in sessionStorage.</p>
+                        </div>
+                        <div class="mode-switch" role="tablist" aria-label="Authentication mode">
+                            <button id="loginModeButton" class="mode-button active" type="button">Login</button>
+                            <button id="registerModeButton" class="mode-button" type="button">Register</button>
+                        </div>
+                    </div>
+
+                    <form id="authForm" class="panel-body stack" autocomplete="off">
+                        <div class="field">
+                            <label for="usernameInput">Username</label>
+                            <input id="usernameInput" name="username" type="text" maxlength="64" autocomplete="username"
+                                spellcheck="false" required>
+                        </div>
+                        <div class="field">
+                            <label for="passwordInput">Password</label>
+                            <input id="passwordInput" name="password" type="password" autocomplete="current-password"
+                                required>
+                        </div>
+                        <div class="field hidden" id="confirmPasswordField">
+                            <label for="confirmPasswordInput">Confirm password</label>
+                            <input id="confirmPasswordInput" name="confirmPassword" type="password"
+                                autocomplete="new-password">
+                        </div>
+                        <button id="authSubmitButton" class="primary" type="submit">Login</button>
+                        <p class="form-message" id="authMessage" aria-live="polite"></p>
+                    </form>
+                </section>
+
+                <section class="panel hidden" id="sessionPanel">
+                    <div class="panel-header compact-header">
+                        <div>
+                            <h2 class="panel-title">Session</h2>
+                            <p class="panel-note" id="sessionExpiresAt">-</p>
+                        </div>
+                        <button id="logoutButton" class="ghost" type="button">Logout</button>
+                    </div>
+                    <div class="panel-body stack">
+                        <div class="identity-card">
+                            <span class="avatar" id="sessionAvatar">?</span>
+                            <div>
+                                <p class="identity-name" id="sessionUsername">-</p>
+                                <p class="identity-id" id="sessionUserId">-</p>
+                            </div>
+                        </div>
+                        <div class="field">
+                            <label for="apiBaseUrl">REST API base</label>
+                            <input id="apiBaseUrl" type="url" autocomplete="off" spellcheck="false">
+                        </div>
+                        <div class="field">
+                            <label for="socketUrl">WebSocket URL</label>
+                            <input id="socketUrl" type="url" autocomplete="off" spellcheck="false">
+                        </div>
+                        <div class="button-row">
+                            <button id="connectButton" class="primary" type="button" disabled>Connect</button>
+                            <button id="disconnectButton" class="danger" type="button" disabled>Disconnect</button>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="panel" id="membersPanel">
+                    <div class="panel-header">
+                        <div>
+                            <h2 class="panel-title">Members</h2>
+                            <p class="panel-note" id="memberSummary">No active members.</p>
+                        </div>
+                    </div>
+                    <div class="panel-body">
+                        <div id="memberList" class="member-list" aria-live="polite">
+                            <div class="member-empty">No active members.</div>
+                        </div>
+                    </div>
+                </section>
+            </aside>
+
+            <section class="chat-panel panel" aria-label="Public chat room">
+                <div class="panel-header chat-header">
+                    <div>
+                        <h2 class="panel-title">Public room</h2>
+                        <p class="panel-note">Recent room history is loaded when you connect.</p>
+                    </div>
+                    <button id="clearMessagesButton" class="ghost" type="button">Clear</button>
+                </div>
+
+                <div id="messageStream" class="message-stream" aria-live="polite">
+                    <div class="empty-state">Login and connect to start chatting.</div>
+                </div>
+
+                <form id="messageForm" class="composer" autocomplete="off">
+                    <label class="sr-only" for="messageInput">Message</label>
+                    <textarea id="messageInput" rows="3" placeholder="Write a message" spellcheck="true"
+                        disabled></textarea>
+                    <button id="sendButton" class="primary send-button" type="submit" disabled>Send</button>
+                </form>
+            </section>
+
+            <section class="panel diagnostics" id="diagnosticsPanel" aria-label="Diagnostic event log">
+                <div class="panel-header">
+                    <div>
+                        <h2 class="panel-title">Diagnostics</h2>
+                        <p class="panel-note">Connection, healthcheck, and server-push events.</p>
+                    </div>
+                    <div class="panel-actions">
+                        <button id="diagnosticsToggleButton" class="ghost" type="button"
+                            aria-expanded="false">Show</button>
+                        <button id="clearLogButton" class="ghost" type="button">Clear</button>
+                    </div>
+                </div>
+                <div class="panel-body">
+                    <div id="logList" class="log-list" aria-live="polite">
+                        <div class="log-empty">No events yet.</div>
+                    </div>
+                </div>
+            </section>
+        </section>
+    </main>
+
+    <script src="https://unpkg.com/@stomp/stompjs@7.0.0/bundles/stomp.umd.min.js"></script>
+    <script type="module" src="js/app.js"></script>
+</body>
+
+</html>

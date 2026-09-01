@@ -1,0 +1,302 @@
+# 建立專案使用的命名空間，讓相關資源集中在 webchat 底下管理。
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: webchat
+  labels:
+    environment: dev
+---
+# 儲存拉取 GitLab Container Registry 私有映像所需的認證資訊。
+apiVersion: v1
+kind: Secret
+metadata:
+  name: gitlab-registry-secret
+  namespace: webchat
+# kubernetes.io/dockerconfigjson 是 Kubernetes 用來存放 Docker registry 認證的 Secret 類型。
+type: kubernetes.io/dockerconfigjson
+data:
+  # .dockerconfigjson 內容需為 base64 編碼後的 Docker config JSON。
+  # 正式環境建議使用 kubectl create secret docker-registry 或外部 Secret 管理工具產生，避免把可用憑證提交到版本庫。
+  .dockerconfigjson: {{img-accessKey}}
+---
+# webchatapi 與 webchatsocket 共用的非敏感設定。
+# 需搭配同 namespace 中名稱為 mysql、redis、rabbitmq 的 Service。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: webchat-app-config
+  namespace: webchat
+  labels:
+    environment: dev
+    app.kubernetes.io/part-of: webchat
+data:
+  # 啟用 Spring Boot dev profile，讓容器使用開發環境設定。
+  SPRING_PROFILES_ACTIVE: "dev"
+  # 讓 Spring Boot Actuator 產生 Kubernetes 可用的 liveness/readiness health group。
+  MANAGEMENT_ENDPOINT_HEALTH_PROBES_ENABLED: "true"
+  # 透過 infra-kit.yml 建立的 mysql Service 名稱連線；同 namespace 內可直接用服務名稱解析。
+  MYSQL_URL: "jdbc:mysql://mysql:3306/webchat?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC&characterEncoding=utf8"
+  MYSQL_USERNAME: "webuser"
+  # Redis 連線設定，供應用保存快取或即時狀態。
+  REDIS_HOST: "redis"
+  REDIS_PORT: "6379"
+  # RabbitMQ 連線設定，供 API 與 WebSocket 服務交換聊天事件。
+  RABBITMQ_HOST: "rabbitmq"
+  RABBITMQ_PORT: "5672"
+  RABBITMQ_USERNAME: "webuser"
+  RABBITMQ_VHOST: "/"
+---
+# webchatapi 與 webchatsocket 共用的執行期敏感設定；正式環境請改由外部 Secret 管理。
+apiVersion: v1
+kind: Secret
+metadata:
+  name: webchat-runtime-secret
+  namespace: webchat
+  labels:
+    environment: dev
+    app.kubernetes.io/part-of: webchat
+type: Opaque
+stringData:
+  # 資料庫、RabbitMQ 密碼與 JWT 簽章金鑰以 Secret 注入，避免放入 ConfigMap。
+  MYSQL_PASSWORD: "webpass"
+  RABBITMQ_PASSWORD: "webpass"
+  WEBCHAT_JWT_SECRET: "webchat-dev-jwt-secret-32-bytes-minimum"
+---
+# 部署 webchatapi REST API，提供登入、使用者、訊息與聊天室歷史 API。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: webchatapi-deployment
+  namespace: webchat
+  labels:
+    environment: dev
+    app: webchatapi
+    version: latest
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: webchatapi
+  template:
+    metadata:
+      labels:
+        app: webchatapi
+        version: latest
+    spec:
+      containers:
+      - name: webchatapi
+        # IfNotPresent 會優先使用節點既有映像；節點沒有此 latest 映像時才會向 registry 拉取。
+        image: "{{img-repo}}/webchatapi:latest"
+        imagePullPolicy: IfNotPresent
+        # 控制 JVM 服務可使用的 Pod 資源，避免本機叢集被單一服務吃滿。
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "150m"
+          limits:
+            memory: "800Mi"
+            cpu: "1000m"
+        ports:
+        - name: http
+          containerPort: 9091
+          protocol: TCP
+        # envFrom 一次匯入共用 ConfigMap 與 Secret，讓兩個 Spring Boot 服務使用同一組連線設定。
+        envFrom:
+        - configMapRef:
+            name: webchat-app-config
+        - secretRef:
+            name: webchat-runtime-secret
+        env:
+        # 應用程式實際監聽的 HTTP port，需和 containerPort 與 Service targetPort 對應。
+        - name: WEBCHATAPI_PORT
+          value: "9091"
+        # API 呼叫 socket 服務時使用的叢集內部位址。
+        - name: WEBCHAT_SOCKET_API_BASE_URL
+          value: "http://webchatsocket-loadbalancer:9092"
+        # 指定容器內 log 目錄，與應用程式 logback 設定對齊。
+        - name: APP_LOG_PATH
+          value: "/var/log/webchatapi"
+        - name: LOG_PATH
+          value: "/var/log/webchatapi"
+        # JVM 記憶體上限需低於 Pod memory limit，避免容器因 OOM 被重啟。
+        - name: JAVA_OPTS
+          value: "-Xms128m -Xmx384m -XX:+UseG1GC -XX:ActiveProcessorCount=1 -XX:MaxRAMPercentage=65"
+        # startupProbe 給 Spring Boot 啟動與依賴連線初始化較長時間。
+        startupProbe:
+          httpGet:
+            path: /actuator/health/liveness
+            port: http
+          initialDelaySeconds: 90
+          periodSeconds: 10
+          timeoutSeconds: 10
+          failureThreshold: 60
+        # readinessProbe 通過後，Service 才會把請求導向此 Pod。
+        readinessProbe:
+          httpGet:
+            path: /actuator/health/readiness
+            port: http
+          periodSeconds: 10
+          timeoutSeconds: 10
+          failureThreshold: 5
+        # livenessProbe 用來偵測服務是否失去回應，失敗達門檻時由 Kubernetes 重啟容器。
+        livenessProbe:
+          httpGet:
+            path: /actuator/health/liveness
+            port: http
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 5
+      # 指定拉取私有 GitLab Registry 映像時要使用的認證 Secret。
+      imagePullSecrets:
+      - name: gitlab-registry-secret
+---
+# webchatapi 的叢集內部 Service；其他 Pod 可透過 webchatapi-clusterip:9091 存取 REST API。
+apiVersion: v1
+kind: Service
+metadata:
+  name: webchatapi-clusterip
+  namespace: webchat
+  labels:
+    environment: dev
+    app: webchatapi
+spec:
+  type: ClusterIP
+  # selector 會挑選 labels.app=webchatapi 的 Pod 作為後端端點。
+  selector:
+    app: webchatapi
+  ports:
+  - name: http
+    port: 9091
+    targetPort: http
+    protocol: TCP
+---
+# 部署 webchatsocket WebSocket/STOMP 服務；Pod 名稱會注入為 node id，避免多副本共用同一條 RabbitMQ queue。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: webchatsocket-deployment
+  namespace: webchat
+  labels:
+    environment: dev
+    app: webchatsocket
+    version: latest
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: webchatsocket
+  template:
+    metadata:
+      labels:
+        app: webchatsocket
+        version: latest
+    spec:
+      # 給 WebSocket 連線在 Pod 終止前一段緩衝時間，讓應用程式有機會完成優雅關閉。
+      terminationGracePeriodSeconds: 30
+      containers:
+      - name: webchatsocket
+        # WebSocket 服務映像，同樣使用私有 GitLab Registry 的 latest tag。
+        image: "{{img-repo}}/webchatsocket:latest"
+        imagePullPolicy: IfNotPresent
+        # 多副本 socket 服務各自保留 JVM 資源界線，避免水平擴展時壓垮本機節點。
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "150m"
+          limits:
+            memory: "800Mi"
+            cpu: "1000m"
+        ports:
+        - name: http
+          containerPort: 9092
+          protocol: TCP
+        # 匯入 MySQL、Redis、RabbitMQ 與 JWT 等共用執行期設定。
+        envFrom:
+        - configMapRef:
+            name: webchat-app-config
+        - secretRef:
+            name: webchat-runtime-secret
+        env:
+        # WebSocket/STOMP 服務監聽的 HTTP port。
+        - name: WEBCHAT_SOCKET_PORT
+          value: "9092"
+        # 使用 Pod metadata.name 作為節點 ID，讓每個副本有獨立識別與 RabbitMQ queue 命名基礎。
+        - name: WEBCHAT_SOCKET_NODE_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        # 指定 socket 服務容器內 log 目錄。
+        - name: APP_LOG_PATH
+          value: "/var/log/webchatsocket"
+        - name: LOG_PATH
+          value: "/var/log/webchatsocket"
+        # JVM heap 上限與 Pod memory limit 保持餘裕，避免 Native memory 或 metaspace 造成 OOM。
+        - name: JAVA_OPTS
+          value: "-Xms128m -Xmx384m -XX:+UseG1GC -XX:ActiveProcessorCount=1 -XX:MaxRAMPercentage=65"
+        # Spring Boot 與訊息 broker 初始化可能較久，startupProbe 避免啟動期被誤判失敗。
+        startupProbe:
+          httpGet:
+            path: /actuator/health/liveness
+            port: http
+          initialDelaySeconds: 90
+          periodSeconds: 10
+          timeoutSeconds: 10
+          failureThreshold: 60
+        # readinessProbe 控制此 socket Pod 是否加入負載平衡端點。
+        readinessProbe:
+          httpGet:
+            path: /actuator/health/readiness
+            port: http
+          periodSeconds: 10
+          timeoutSeconds: 10
+          failureThreshold: 5
+        # livenessProbe 偵測 socket 服務健康狀態，異常時由 Kubernetes 重啟。
+        livenessProbe:
+          httpGet:
+            path: /actuator/health/liveness
+            port: http
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 5
+      # 拉取 webchatsocket 私有映像所需的 registry 認證。
+      imagePullSecrets:
+      - name: gitlab-registry-secret
+---
+# 舊版 MetalLB 使用 ConfigMap 設定 L2 address pool。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: config
+  namespace: metallb-system
+data:
+  config: |
+    address-pools:
+    - name: webchat-address-pool
+      protocol: layer2
+      addresses:
+      - {{ip-range-start}}-{{ip-range-end}}
+---
+# webchatsocket 對外 Service；Minikube 可透過 LoadBalancer 或 minikube tunnel 暴露 WebSocket 入口。
+apiVersion: v1
+kind: Service
+metadata:
+  name: webchatsocket-loadbalancer
+  namespace: webchat
+  annotations:
+    # 指定由 MetalLB 的 webchat-address-pool 分配 external IP。
+    metallb.universe.tf/address-pool: webchat-address-pool
+  labels:
+    environment: dev
+    app: webchatsocket
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Cluster
+  sessionAffinity: None
+  # 將外部 WebSocket 流量分散到所有 labels.app=webchatsocket 的 Pod。
+  selector:
+    app: webchatsocket
+  ports:
+  - name: websocket
+    port: 9092
+    targetPort: http
+    protocol: TCP

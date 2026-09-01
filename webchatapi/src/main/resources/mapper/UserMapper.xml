@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+        PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.springtest.webchatapi.repository.UserMapper">
+
+    <resultMap id="UserModelMap" type="UserModel">
+        <id property="userId" column="user_id" />
+        <result property="username" column="username" />
+        <result property="level" column="level" />
+        <result property="money" column="money" />
+        <result property="createTime" column="create_time" />
+        <result property="updateTime" column="update_time" />
+    </resultMap>
+
+    <sql id="BaseColumns">
+        user_id, username, level, money, create_time, update_time
+    </sql>
+
+    <insert id="insert" parameterType="UserModel">
+        INSERT INTO user_record (user_id, username, level, money, create_time, update_time)
+        VALUES (#{userId}, #{username}, #{level}, #{money}, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+    </insert>
+
+    <select id="findById" resultMap="UserModelMap">
+        SELECT <include refid="BaseColumns" />
+        FROM user_record
+        WHERE user_id = #{userId}
+    </select>
+
+    <select id="findAll" resultMap="UserModelMap">
+        SELECT <include refid="BaseColumns" />
+        FROM user_record
+        <where>
+            <if test="username != null and username != ''">
+                username LIKE CONCAT('%', #{username}, '%')
+            </if>
+        </where>
+        ORDER BY create_time DESC, user_id DESC
+        LIMIT #{limit} OFFSET #{offset}
+    </select>
+
+    <select id="count" resultType="long">
+        SELECT COUNT(*)
+        FROM user_record
+        <where>
+            <if test="username != null and username != ''">
+                username LIKE CONCAT('%', #{username}, '%')
+            </if>
+        </where>
+    </select>
+
+    <update id="update" parameterType="UserModel">
+        UPDATE user_record
+        SET username = #{username},
+            level = #{level},
+            money = #{money},
+            update_time = CURRENT_TIMESTAMP
+        WHERE user_id = #{userId}
+    </update>
+
+    <delete id="deleteById">
+        DELETE FROM user_record
+        WHERE user_id = #{userId}
+    </delete>
+</mapper>

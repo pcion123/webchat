@@ -1,0 +1,415 @@
+# Minikube 開發環境用基礎設施：MySQL、Redis、RabbitMQ。
+# 套用順序建議：kubectl apply -f infra-kit.yml，再套用 webchat-deploy.yml。
+
+# 建立 webchat 專用命名空間，讓開發環境的資源集中管理並避免和其他服務混在一起。
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: webchat
+  labels:
+    environment: dev
+---
+# 集中保存基礎設施帳號密碼；目前是 Minikube 開發用預設值，正式環境應改由外部 Secret 管理。
+apiVersion: v1
+kind: Secret
+metadata:
+  name: webchat-infra-secret
+  namespace: webchat
+  labels:
+    environment: dev
+    app.kubernetes.io/part-of: webchat
+type: Opaque
+stringData:
+  MYSQL_ROOT_PASSWORD: "root"
+  MYSQL_DATABASE: "webchat"
+  MYSQL_USER: "webuser"
+  MYSQL_PASSWORD: "webpass"
+  RABBITMQ_DEFAULT_USER: "webuser"
+  RABBITMQ_DEFAULT_PASS: "webpass"
+---
+# MySQL 資料目錄首次初始化時會執行此 ConfigMap 內的 init.sql，建立資料庫、帳號權限與基礎資料表。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mysql-init-sql
+  namespace: webchat
+  labels:
+    environment: dev
+    app.kubernetes.io/part-of: webchat
+data:
+  init.sql: |
+    -- 建立主要資料庫與測試資料庫，皆使用 utf8mb4 以支援完整 Unicode 字元。
+    CREATE DATABASE IF NOT EXISTS webchat CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+    CREATE DATABASE IF NOT EXISTS webchat_test CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+    -- 授權應用程式使用者存取主要與測試資料庫。
+    GRANT ALL PRIVILEGES ON webchat.* TO 'webuser'@'%';
+    GRANT ALL PRIVILEGES ON webchat_test.* TO 'webuser'@'%';
+
+    USE webchat;
+
+    -- 使用者主資料，供帳號資料以 user_id 關聯。
+    CREATE TABLE IF NOT EXISTS user_record (
+      user_id VARCHAR(32) NOT NULL,
+      username VARCHAR(64) NOT NULL,
+      level INT NOT NULL DEFAULT 0,
+      money DECIMAL(19, 3) NOT NULL DEFAULT 0.000,
+      create_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      update_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (user_id)
+    );
+
+    -- 登入帳號資料；刪除使用者時會透過外鍵同步刪除對應帳號。
+    CREATE TABLE IF NOT EXISTS account (
+      account_id VARCHAR(32) NOT NULL,
+      user_id VARCHAR(32) NOT NULL,
+      username VARCHAR(64) NOT NULL,
+      password_hash VARCHAR(255) NOT NULL,
+      status VARCHAR(16) NOT NULL DEFAULT 'ACTIVE',
+      last_login_time TIMESTAMP NULL,
+      create_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      update_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (account_id),
+      CONSTRAINT uk_account_user_id UNIQUE (user_id),
+      CONSTRAINT uk_account_username UNIQUE (username),
+      CONSTRAINT fk_account_user_record FOREIGN KEY (user_id)
+        REFERENCES user_record(user_id) ON DELETE CASCADE
+    );
+
+    USE webchat_test;
+
+    -- 測試資料庫維持與主要資料庫相同 schema，方便整合測試使用。
+    CREATE TABLE IF NOT EXISTS user_record (
+      user_id VARCHAR(32) NOT NULL,
+      username VARCHAR(64) NOT NULL,
+      level INT NOT NULL DEFAULT 0,
+      money DECIMAL(19, 3) NOT NULL DEFAULT 0.000,
+      create_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      update_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (user_id)
+    );
+
+    -- 測試用帳號表 schema 與主要資料庫一致。
+    CREATE TABLE IF NOT EXISTS account (
+      account_id VARCHAR(32) NOT NULL,
+      user_id VARCHAR(32) NOT NULL,
+      username VARCHAR(64) NOT NULL,
+      password_hash VARCHAR(255) NOT NULL,
+      status VARCHAR(16) NOT NULL DEFAULT 'ACTIVE',
+      last_login_time TIMESTAMP NULL,
+      create_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      update_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (account_id),
+      CONSTRAINT uk_account_user_id UNIQUE (user_id),
+      CONSTRAINT uk_account_username UNIQUE (username),
+      CONSTRAINT fk_account_user_record FOREIGN KEY (user_id)
+        REFERENCES user_record(user_id) ON DELETE CASCADE
+    );
+
+    FLUSH PRIVILEGES;
+---
+# MySQL ClusterIP Service，提供叢集內部服務用 mysql:3306 連線。
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql
+  namespace: webchat
+  labels:
+    environment: dev
+    app: mysql
+spec:
+  type: ClusterIP
+  selector:
+    app: mysql
+  ports:
+  - name: mysql
+    port: 3306
+    targetPort: mysql
+    protocol: TCP
+---
+# MySQL 使用 emptyDir 暫存資料目錄；Pod 被刪除或重建後資料庫資料不保留。
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mysql
+  namespace: webchat
+  labels:
+    environment: dev
+    app: mysql
+spec:
+  serviceName: mysql
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mysql
+  template:
+    metadata:
+      labels:
+        app: mysql
+    spec:
+      containers:
+      - name: mysql
+        image: mysql:8.0
+        imagePullPolicy: IfNotPresent
+        # 調整 MySQL 編碼與開發環境資源參數，降低 Minikube 負載。
+        args:
+        - --character-set-server=utf8mb4
+        - --collation-server=utf8mb4_unicode_ci
+        - --performance-schema=OFF
+        - --innodb-buffer-pool-size=128M
+        - --innodb-flush-log-at-trx-commit=2
+        - --max-connections=100
+        ports:
+        - name: mysql
+          containerPort: 3306
+          protocol: TCP
+        # 從共用 Secret 注入 MySQL 初始化與登入所需的帳號密碼。
+        env:
+        - name: MYSQL_ROOT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: webchat-infra-secret
+              key: MYSQL_ROOT_PASSWORD
+        - name: MYSQL_DATABASE
+          valueFrom:
+            secretKeyRef:
+              name: webchat-infra-secret
+              key: MYSQL_DATABASE
+        - name: MYSQL_USER
+          valueFrom:
+            secretKeyRef:
+              name: webchat-infra-secret
+              key: MYSQL_USER
+        - name: MYSQL_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: webchat-infra-secret
+              key: MYSQL_PASSWORD
+        volumeMounts:
+        # mysql-data 使用 Pod 暫存儲存體；mysql-init-sql 只在資料目錄首次初始化時執行。
+        - name: mysql-data
+          mountPath: /var/lib/mysql
+        - name: mysql-init-sql
+          mountPath: /docker-entrypoint-initdb.d/init.sql
+          subPath: init.sql
+          readOnly: true
+        # startupProbe 給 MySQL 較長啟動時間，避免初始化期間被 livenessProbe 重啟。
+        startupProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - mysqladmin ping -h 127.0.0.1 -uroot -p$MYSQL_ROOT_PASSWORD
+          periodSeconds: 10
+          timeoutSeconds: 10
+          failureThreshold: 30
+        # readinessProbe 決定 Service 是否將流量導向此 Pod。
+        readinessProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - mysqladmin ping -h 127.0.0.1 -uroot -p$MYSQL_ROOT_PASSWORD
+          periodSeconds: 10
+          timeoutSeconds: 10
+          failureThreshold: 6
+        # livenessProbe 偵測 MySQL 是否卡死；失敗達門檻時由 Kubernetes 重啟容器。
+        livenessProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - mysqladmin ping -h 127.0.0.1 -uroot -p$MYSQL_ROOT_PASSWORD
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 3
+        # 開發環境資源限制，避免單一資料庫吃滿 Minikube 節點。
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "200m"
+          limits:
+            memory: "768Mi"
+            cpu: "2000m"
+      volumes:
+      - name: mysql-data
+        emptyDir: {}
+      - name: mysql-init-sql
+        configMap:
+          name: mysql-init-sql
+---
+# Redis ClusterIP Service，供叢集內部服務透過 redis:6379 存取快取或暫存資料。
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: webchat
+  labels:
+    environment: dev
+    app: redis
+spec:
+  type: ClusterIP
+  selector:
+    app: redis
+  ports:
+  - name: redis
+    port: 6379
+    targetPort: redis
+    protocol: TCP
+---
+# Redis 作為開發環境快取使用，不啟用持久化資料保存。
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  namespace: webchat
+  labels:
+    environment: dev
+    app: redis
+spec:
+  serviceName: redis
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+      - name: redis
+        image: redis:7
+        imagePullPolicy: IfNotPresent
+        # 關閉 AOF 與 RDB snapshot，避免 Redis 寫入持久化檔案。
+        args:
+        - redis-server
+        - --appendonly
+        - "no"
+        - --save
+        - ""
+        ports:
+        - name: redis
+          containerPort: 6379
+          protocol: TCP
+        # Redis 使用 TCP 探針即可判斷服務埠是否可接受連線。
+        readinessProbe:
+          tcpSocket:
+            port: redis
+          periodSeconds: 10
+          timeoutSeconds: 10
+          failureThreshold: 6
+        # livenessProbe 監控 Redis 服務埠，失敗達門檻時重啟容器。
+        livenessProbe:
+          tcpSocket:
+            port: redis
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 3
+        # Redis 在開發環境中保留較小 request，並設定上限避免佔用過多資源。
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "25m"
+          limits:
+            memory: "256Mi"
+            cpu: "500m"
+---
+# RabbitMQ ClusterIP Service，供後端服務透過 rabbitmq:5672 使用 AMQP。
+apiVersion: v1
+kind: Service
+metadata:
+  name: rabbitmq
+  namespace: webchat
+  labels:
+    environment: dev
+    app: rabbitmq
+spec:
+  type: ClusterIP
+  selector:
+    app: rabbitmq
+  ports:
+  - name: amqp
+    port: 5672
+    targetPort: amqp
+    protocol: TCP
+---
+# RabbitMQ 使用記憶體暫存 volume；Pod 被刪除或重建後 broker 狀態不保留。
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rabbitmq
+  namespace: webchat
+  labels:
+    environment: dev
+    app: rabbitmq
+spec:
+  serviceName: rabbitmq
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rabbitmq
+  template:
+    metadata:
+      labels:
+        app: rabbitmq
+    spec:
+      containers:
+      - name: rabbitmq
+        image: rabbitmq:4
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: amqp
+          containerPort: 5672
+          protocol: TCP
+        # RabbitMQ 預設使用者與密碼由共用 Secret 注入。
+        env:
+        - name: RABBITMQ_DEFAULT_USER
+          valueFrom:
+            secretKeyRef:
+              name: webchat-infra-secret
+              key: RABBITMQ_DEFAULT_USER
+        - name: RABBITMQ_DEFAULT_PASS
+          valueFrom:
+            secretKeyRef:
+              name: webchat-infra-secret
+              key: RABBITMQ_DEFAULT_PASS
+        # 限制 Erlang scheduler 與 busy wait 行為，讓本機 Minikube 較穩定。
+        - name: RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS
+          value: "+S 2:2 +sbwt none +sbwtdcpu none +sbwtdio none"
+        volumeMounts:
+        - name: rabbitmq-data
+          mountPath: /var/lib/rabbitmq
+        # RabbitMQ 啟動可能較慢，startupProbe 給足等待時間避免初始化過程被重啟。
+        startupProbe:
+          tcpSocket:
+            port: amqp
+          periodSeconds: 10
+          timeoutSeconds: 10
+          failureThreshold: 60
+        # readinessProbe 控制 Pod 是否可以被後端服務連線使用。
+        readinessProbe:
+          tcpSocket:
+            port: amqp
+          periodSeconds: 10
+          timeoutSeconds: 10
+          failureThreshold: 6
+        # livenessProbe 持續檢查 AMQP 埠，服務異常時交由 Kubernetes 重啟容器。
+        livenessProbe:
+          tcpSocket:
+            port: amqp
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 3
+        # RabbitMQ 在開發環境仍需要較多 CPU 啟動與運行，這裡保留明確資源界線。
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "1Gi"
+            cpu: "5000m"
+      volumes:
+      - name: rabbitmq-data
+        emptyDir:
+          medium: Memory
